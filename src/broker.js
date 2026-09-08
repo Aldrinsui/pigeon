@@ -56,11 +56,14 @@ export class PigeonBroker {
     this.audit.write("schema.registered", { schema: name });
   }
 
+  // Register a bearer token that authenticates as `principal` (FND-01).
   registerToken(token, principal) {
     this.auth.registerToken(token, principal);
     return this;
   }
 
+  // Resolve a bearer credential to a principal server-side. Never trust a
+  // client-supplied identity - use this and bind the result to the session.
   authenticate(credential) {
     return this.auth.authenticate(credential);
   }
@@ -69,6 +72,10 @@ export class PigeonBroker {
     return [...this.subjects.values()];
   }
 
+  // Negotiate a session contract for an already-authenticated principal (FND-02).
+  // Compiles the policy relevant to the principal + requested subjects into a
+  // contract whose operations are decided at identity level; per-message gates
+  // (intent, region, schema, ...) still run on every publish.
   negotiate(context, { subjects, ttlMs } = {}) {
     const principal = context.principal;
     if (!principal?.id) {
@@ -104,6 +111,8 @@ export class PigeonBroker {
     return contract;
   }
 
+  // Convenience: negotiate a contract and return a session bound to it, so callers
+  // publish/receive/replay/ack without threading the contract id by hand.
   connect(context, options = {}) {
     const contract = this.negotiate(context, options);
     const bind = { ...context, contractId: contract.id };
@@ -128,6 +137,7 @@ export class PigeonBroker {
     let decisionMeta = {};
 
     try {
+      requireAuthenticatedContext(context);
       validateEnvelope(input);
       subject = this.getSubject(input.subject);
       this.contracts.validate(
@@ -137,6 +147,7 @@ export class PigeonBroker {
         "publish"
       );
 
+      // Identity is bound to the authenticated session, not the message body (FND-01).
       message = normalizeMessage(input, context.principal.id);
       const evaluationContext = { ...context, intent: message.intent, region: message.region, message };
       decisionMeta = {
@@ -192,6 +203,7 @@ export class PigeonBroker {
         ...decisionMeta
       });
 
+      // Deliver a queued reply back to a waiting requester, if any (FND-09).
       this.routeReply(subject, committed);
 
       span.setAttribute("pigeon.outcome", "accepted");
@@ -223,6 +235,7 @@ export class PigeonBroker {
     });
 
     try {
+      requireAuthenticatedContext(context);
       const subject = this.getSubject(subjectName);
       this.contracts.validate(context.contractId, context.principal.id, subject.name, "receive");
       this.policy.assertAllowed("receive", subject, { ...context, region: context.region ?? subject.regionPolicy?.home });
@@ -248,6 +261,8 @@ export class PigeonBroker {
         });
       }
 
+      // Advance the cursor past the highest dispatched message so at-least-once
+      // delivery does not silently skip work-queue entries that were held back.
       if (available.length > 0) {
         const lastSequence = available[available.length - 1].sequence;
         const log = this.store.listMessages(subjectName);
@@ -295,6 +310,7 @@ export class PigeonBroker {
     });
 
     try {
+      requireAuthenticatedContext(context);
       const subject = this.getSubject(subjectName);
 
       if (!subject.replay?.allowed) {
@@ -348,6 +364,7 @@ export class PigeonBroker {
   }
 
   ack(subjectName, messageId, context) {
+    requireAuthenticatedContext(context);
     const subject = this.getSubject(subjectName);
     this.contracts.validate(context.contractId, context.principal.id, subject.name, "ack");
     this.policy.assertAllowed("ack", subject, { ...context, region: context.region ?? subject.regionPolicy?.home });
@@ -363,6 +380,8 @@ export class PigeonBroker {
     return message;
   }
 
+  // Collect a reply routed for a correlationId (FND-09). Returns the reply message
+  // or null if none has arrived yet.
   takeReply(correlationId) {
     return this.store.takeReply(correlationId);
   }
@@ -375,6 +394,8 @@ export class PigeonBroker {
     return this.store.listQuarantine();
   }
 
+  // Replay a quarantined message back onto its subject, under a fresh contract held
+  // by an authorized principal (FND-11). The original evidence is left in place.
   releaseQuarantine(quarantineId, context) {
     const record = this.store.findQuarantine(quarantineId);
     if (!record) {
@@ -442,6 +463,11 @@ export class PigeonBroker {
       }
     }
 
+    // subject.data.tokenization = "required" is an enforced guarantee, not just
+    // documentation: a field named here must not carry a raw, un-tokenized card
+    // number. (subject.data.encryption is deliberately NOT enforced here - transport
+    // and at-rest encryption are properties of the deployment, not of a message's
+    // JSON content, and this layer cannot verify them.)
     for (const path of subject.data?.tokenizedFields ?? []) {
       const value = getPath(message.data, path);
       if (typeof value === "string" && looksLikeRawCardNumber(value)) {
@@ -464,6 +490,8 @@ export class PigeonBroker {
     }
   }
 
+  // If this message is a reply carrying a correlationId, hand it to any receiver
+  // waiting on that correlation (FND-09, real request/reply).
   routeReply(subject, message) {
     if (message.correlationId) {
       this.store.resolveReply(message.correlationId, message);
@@ -485,9 +513,11 @@ export class PigeonBroker {
     const shouldQuarantine =
       subject.quarantine?.onSchemaViolation && code === "SCHEMA_INVALID" ||
       subject.quarantine?.onPolicyViolation &&
-      ["SENSITIVE_FIELD_DENIED", "CLASSIFICATION_DENIED", "REGION_DENIED", "INTENT_DENIED", "RAW_PAN_DETECTED"].includes(code);
+        ["SENSITIVE_FIELD_DENIED", "CLASSIFICATION_DENIED", "REGION_DENIED", "INTENT_DENIED", "RAW_PAN_DETECTED"].includes(code);
 
     if (shouldQuarantine && message) {
+      // The record is kept as evidence, but it must not become a durable plaintext
+      // copy of the sensitive value that got the message denied in the first place.
       const redactedPaths = [...(subject.data?.forbiddenFields ?? []), ...(subject.data?.tokenizedFields ?? [])];
       const stored = this.store.addQuarantine({
         subject: subject.name,
@@ -510,6 +540,12 @@ export class PigeonBroker {
   }
 }
 
+function requireAuthenticatedContext(context) {
+  if (!context?.principal?.id) {
+    throw new PigeonError("UNAUTHENTICATED", "Requires an authenticated principal.");
+  }
+}
+
 function validateEnvelope(input) {
   if (!input || typeof input !== "object" || Array.isArray(input)) {
     throw new PigeonError("ENVELOPE_INVALID", "Message envelope must be an object.", { fields: REQUIRED_ENVELOPE_FIELDS });
@@ -529,6 +565,7 @@ function validateEnvelope(input) {
   }
 }
 
+// A work-queue message that has already been acked should not be redelivered.
 function isRedeliveryBlocked(subject, message) {
   if (subject.mode !== "workQueue") {
     return false;
@@ -588,6 +625,10 @@ function getPath(value, path) {
   return current;
 }
 
+// True if `value` is a digit string of card-number length that passes the Luhn
+// checksum - i.e. it looks like a raw PAN rather than an opaque token. Tokens
+// issued by a real tokenization provider do not pass Luhn, so this only flags
+// the case tokenization is meant to prevent: a raw card number sent as-is.
 function looksLikeRawCardNumber(value) {
   const digits = value.replace(/[ -]/g, "");
   if (!/^\d{13,19}$/.test(digits)) {
@@ -607,6 +648,9 @@ function looksLikeRawCardNumber(value) {
   return sum % 10 === 0;
 }
 
+// Deep-clones `message` and replaces the value at each dot-path in `paths` with a
+// redaction marker, so quarantine evidence never becomes a durable plaintext copy
+// of the sensitive value that caused the denial.
 function redactMessage(message, paths) {
   if (paths.length === 0) {
     return message;

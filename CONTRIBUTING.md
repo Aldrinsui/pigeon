@@ -9,7 +9,9 @@ new subjects/policies.
 - Be respectful. This project follows a [Code of Conduct](CODE_OF_CONDUCT.md).
 - Keep the core **dependency-free**. Pigeon deliberately ships with zero runtime
   dependencies (standard-library Node only). Please don't add npm dependencies to
-  `src/` without discussing it in an issue first.
+  `src/` without discussing it in an issue first. The one standing exception is
+  OpenTelemetry, scoped to `src/observability.js` - see
+  [ADR-0007](docs/adr/0007-opentelemetry-observability-exception.md).
 - Discuss large or breaking changes in an issue before opening a PR.
 
 ## Development setup
@@ -30,8 +32,9 @@ npm run demo     # runs the payment authorization demo
 npm start        # starts the HTTP broker on :8787
 ```
 
-There is no build step and no install step for runtime - `npm test` works on a fresh
-clone.
+There is no build step, and no install step to exercise the core broker. `npm install`
+is only needed to run the observability suite, which depends on OpenTelemetry
+(ADR-0007).
 
 ## Container simulation
 
@@ -82,8 +85,7 @@ add a row to the [ADR index](docs/adr/README.md).
 
 [docs/progress.md](docs/progress.md) is the living snapshot of what ships today, what is in
 flight, and what is next. When you land a milestone or shift the near-term focus, update it
-in the same PR. It links to [CHANGELOG.md](CHANGELOG.md) (history) and the
-[Roadmap](docs/vision.md#roadmap) (the plan) rather than duplicating them.
+in the same PR. It links to [CHANGELOG.md](CHANGELOG.md) (history) rather than duplicating it.
 
 ## Releasing
 

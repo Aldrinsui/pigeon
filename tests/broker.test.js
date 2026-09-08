@@ -118,6 +118,19 @@ test("denies a publish with no contract", () => {
   );
 });
 
+test("publish/receive/replay/ack fail closed with a clean error when context is missing, not a raw TypeError", () => {
+  const { broker } = checkoutSession();
+  const isUnauthenticated = (error) => error instanceof PigeonError && error.code === "UNAUTHENTICATED";
+
+  assert.throws(
+    () => broker.publish({ subject: "payments.authorize", type: "t", source: "x", intent: "authorize_payment", data: payment() }),
+    isUnauthenticated
+  );
+  assert.throws(() => broker.receive("payments.authorize"), isUnauthenticated);
+  assert.throws(() => broker.replay("payments.authorize"), isUnauthenticated);
+  assert.throws(() => broker.ack("payments.authorize", "msg_1"), isUnauthenticated);
+});
+
 test("blocks producer spoofing: a principal cannot use another's contract", () => {
   const broker = createDemoBroker(PigeonBroker);
   const checkoutContract = broker.negotiate(checkout, { subjects: ["payments.authorize"] });
@@ -170,6 +183,8 @@ test("requires idempotency keys for payment authorization", () => {
 test("honors the idempotency dedupe window (TTL)", () => {
   let clock = 0;
   const broker = clockedPaymentBroker(() => clock);
+  // Long-lived contract so the shared clock advance below tests the idempotency
+  // window, not contract expiry.
   const session = broker.connect(checkout, { subjects: ["payments.authorize"], ttlMs: 10 ** 15 });
 
   const first = session.request("payments.authorize", payment(), requestOptions());
@@ -179,7 +194,7 @@ test("honors the idempotency dedupe window (TTL)", () => {
 
   clock += 172_800_000 + 1; // one past the payments ttl (48h)
   const afterWindow = session.request("payments.authorize", payment(), requestOptions());
-  assert.equal(afterWindow.status, "accepted");
+  assert.equal(afterWindow.status, "accepted"); // dedupe window elapsed -> treated as new
 });
 
 test("enforces rate limits", () => {
@@ -210,6 +225,7 @@ test("denies messages containing forbidden sensitive fields and quarantines them
   const quarantine = broker.listQuarantine();
   assert.equal(quarantine.length, 1);
   assert.equal(quarantine[0].code, "SENSITIVE_FIELD_DENIED");
+  // The quarantine record must not become a durable plaintext copy of the PAN.
   assert.equal(quarantine[0].message.data.card.pan, "[REDACTED]");
 });
 
@@ -305,6 +321,8 @@ test("releases a quarantined message under an authorized contract", () => {
     PigeonError
   );
   const [record] = broker.listQuarantine();
+  // Repair the payload before releasing (schema was the reason). We release the
+  // *original* which still fails; assert the release path is authorized + audited.
   assert.throws(() => broker.releaseQuarantine(record.id, { principal: checkout.principal, region: "uk", contractId: session.contract.id }), PigeonError);
   assert.ok(broker.listAudit().some((r) => r.type === "quarantine.released"));
 });
