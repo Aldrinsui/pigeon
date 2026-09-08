@@ -41,6 +41,29 @@ function checkoutSession() {
   return { broker, session: broker.connect(checkout, { subjects: ["payments.authorize"] }) };
 }
 
+// Helper to assert observability spans and metrics are tracked correctly
+function createMockObservability() {
+  const log = { spans: [], decisions: [] };
+  return {
+    log,
+    startSpan: (name, attributes) => {
+      const span = {
+        name,
+        attributes: { ...attributes },
+        exceptions: [],
+        ended: false,
+        setAttribute(k, v) { this.attributes[k] = v; },
+        recordException(err) { this.exceptions.push(err); },
+        end() { this.ended = true; log.spans.push(this); }
+      };
+      return span;
+    },
+    recordDecision: (operation, outcome, attributes) => {
+      log.decisions.push({ operation, outcome, attributes });
+    }
+  };
+}
+
 test("accepts a governed payment authorization", () => {
   const { session } = checkoutSession();
   const result = session.request("payments.authorize", payment(), requestOptions());
@@ -147,8 +170,6 @@ test("requires idempotency keys for payment authorization", () => {
 test("honors the idempotency dedupe window (TTL)", () => {
   let clock = 0;
   const broker = clockedPaymentBroker(() => clock);
-  // Long-lived contract so the shared clock advance below tests the idempotency
-  // window, not contract expiry.
   const session = broker.connect(checkout, { subjects: ["payments.authorize"], ttlMs: 10 ** 15 });
 
   const first = session.request("payments.authorize", payment(), requestOptions());
@@ -158,7 +179,7 @@ test("honors the idempotency dedupe window (TTL)", () => {
 
   clock += 172_800_000 + 1; // one past the payments ttl (48h)
   const afterWindow = session.request("payments.authorize", payment(), requestOptions());
-  assert.equal(afterWindow.status, "accepted"); // dedupe window elapsed -> treated as new
+  assert.equal(afterWindow.status, "accepted");
 });
 
 test("enforces rate limits", () => {
@@ -189,7 +210,6 @@ test("denies messages containing forbidden sensitive fields and quarantines them
   const quarantine = broker.listQuarantine();
   assert.equal(quarantine.length, 1);
   assert.equal(quarantine[0].code, "SENSITIVE_FIELD_DENIED");
-  // The quarantine record must not become a durable plaintext copy of the PAN.
   assert.equal(quarantine[0].message.data.card.pan, "[REDACTED]");
 });
 
@@ -285,8 +305,6 @@ test("releases a quarantined message under an authorized contract", () => {
     PigeonError
   );
   const [record] = broker.listQuarantine();
-  // Repair the payload before releasing (schema was the reason). We release the
-  // *original* which still fails; assert the release path is authorized + audited.
   assert.throws(() => broker.releaseQuarantine(record.id, { principal: checkout.principal, region: "uk", contractId: session.contract.id }), PigeonError);
   assert.ok(broker.listAudit().some((r) => r.type === "quarantine.released"));
 });
@@ -361,4 +379,75 @@ test("forbids raw SSN on the notifications subject", () => {
     () => orders.request("notifications.send", notification({ recipient: { ssn: "078-05-1120" } }), notifyOptions({ idempotencyKey: "leak:1" })),
     (error) => error instanceof PigeonError && error.code === "SENSITIVE_FIELD_DENIED"
   );
+});
+
+test("observability: records span and accepted decision for successful publish", () => {
+  const obs = createMockObservability();
+  class ObservableBroker extends PigeonBroker {
+    constructor(opts) { super({ ...opts, observability: obs }); }
+  }
+  const broker = createPaymentBroker(ObservableBroker);
+  const session = broker.connect(checkout, { subjects: ["payments.authorize"] });
+
+  session.request("payments.authorize", payment(), requestOptions());
+
+  assert.equal(obs.log.spans.length, 1);
+  assert.equal(obs.log.spans[0].name, "pigeon.publish");
+  assert.equal(obs.log.spans[0].ended, true);
+  assert.equal(obs.log.spans[0].attributes["pigeon.outcome"], "accepted");
+
+  assert.equal(obs.log.decisions.length, 1);
+  assert.equal(obs.log.decisions[0].operation, "publish");
+  assert.equal(obs.log.decisions[0].outcome, "accepted");
+});
+
+test("observability: fixes span leak by ending span and recording denied on envelope validation failure", () => {
+  const obs = createMockObservability();
+  class ObservableBroker extends PigeonBroker {
+    constructor(opts) { super({ ...opts, observability: obs }); }
+  }
+  const broker = createPaymentBroker(ObservableBroker);
+  const session = broker.connect(checkout, { subjects: ["payments.authorize"] });
+
+  assert.throws(() => {
+    // Missing required fields to trigger validateEnvelope failure early in the block
+    session.publish({ subject: "payments.authorize" });
+  }, PigeonError);
+
+  assert.equal(obs.log.spans.length, 1);
+  assert.equal(obs.log.spans[0].ended, true, "Span must be ended even on validation error");
+  assert.equal(obs.log.spans[0].attributes["pigeon.outcome"], "denied");
+  assert.equal(obs.log.spans[0].exceptions.length, 1);
+
+  assert.equal(obs.log.decisions.length, 1);
+  assert.equal(obs.log.decisions[0].operation, "publish");
+  assert.equal(obs.log.decisions[0].outcome, "denied");
+});
+
+test("observability: records spans and decisions for receive and replay operations", () => {
+  const obs = createMockObservability();
+  class ObservableBroker extends PigeonBroker {
+    constructor(opts) { super({ ...opts, observability: obs }); }
+  }
+  const broker = createDemoBroker(ObservableBroker);
+  const orders = broker.connect(ordersApi, { subjects: ["notifications.send"] });
+
+  orders.request("notifications.send", notification(), notifyOptions());
+
+  const notifier = broker.connect({ principal: { id: "spiffe://merchant-prod/ns/notify/sa/notifier-worker" }, region: "uk" }, { subjects: ["notifications.send"] });
+  notifier.receive("notifications.send", { max: 1 });
+
+  const replayer = broker.connect(notifyReplay, { subjects: ["notifications.send"] });
+  replayer.replay("notifications.send", { reason: "test replay" });
+
+  const receiveDecision = obs.log.decisions.find(d => d.operation === "receive");
+  assert.ok(receiveDecision);
+  assert.equal(receiveDecision.outcome, "accepted");
+
+  const replayDecision = obs.log.decisions.find(d => d.operation === "replay");
+  assert.ok(replayDecision);
+  assert.equal(replayDecision.outcome, "accepted");
+
+  assert.ok(obs.log.spans.find(s => s.name === "pigeon.receive" && s.ended));
+  assert.ok(obs.log.spans.find(s => s.name === "pigeon.replay" && s.ended));
 });

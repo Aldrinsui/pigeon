@@ -56,14 +56,11 @@ export class PigeonBroker {
     this.audit.write("schema.registered", { schema: name });
   }
 
-  // Register a bearer token that authenticates as `principal` (FND-01).
   registerToken(token, principal) {
     this.auth.registerToken(token, principal);
     return this;
   }
 
-  // Resolve a bearer credential to a principal server-side. Never trust a
-  // client-supplied identity - use this and bind the result to the session.
   authenticate(credential) {
     return this.auth.authenticate(credential);
   }
@@ -72,10 +69,6 @@ export class PigeonBroker {
     return [...this.subjects.values()];
   }
 
-  // Negotiate a session contract for an already-authenticated principal (FND-02).
-  // Compiles the policy relevant to the principal + requested subjects into a
-  // contract whose operations are decided at identity level; per-message gates
-  // (intent, region, schema, ...) still run on every publish.
   negotiate(context, { subjects, ttlMs } = {}) {
     const principal = context.principal;
     if (!principal?.id) {
@@ -111,8 +104,6 @@ export class PigeonBroker {
     return contract;
   }
 
-  // Convenience: negotiate a contract and return a session bound to it, so callers
-  // publish/receive/replay/ack without threading the contract id by hand.
   connect(context, options = {}) {
     const contract = this.negotiate(context, options);
     const bind = { ...context, contractId: contract.id };
@@ -129,29 +120,32 @@ export class PigeonBroker {
   publish(input, context) {
     const span = this.observability.startSpan("pigeon.publish", {
       "pigeon.operation": "publish",
-      "pigeon.subject": input?.subject
+      "pigeon.subject": input?.subject ?? "unknown"
     });
 
-    validateEnvelope(input);
-    const subject = this.getSubject(input.subject);
-    const { subject: contractSubject } = this.contracts.validate(
-      context.contractId,
-      context.principal.id,
-      subject.name,
-      "publish"
-    );
-
-    // Identity is bound to the authenticated session, not the message body (FND-01).
-    const message = normalizeMessage(input, context.principal.id);
-    const evaluationContext = { ...context, intent: message.intent, region: message.region, message };
-    const decisionMeta = {
-      contractId: context.contractId,
-      policyId: subject.policyId,
-      schemaId: subject.schemaId,
-      subjectId: subject.subjectId
-    };
+    let subject;
+    let message;
+    let decisionMeta = {};
 
     try {
+      validateEnvelope(input);
+      subject = this.getSubject(input.subject);
+      this.contracts.validate(
+        context.contractId,
+        context.principal.id,
+        subject.name,
+        "publish"
+      );
+
+      message = normalizeMessage(input, context.principal.id);
+      const evaluationContext = { ...context, intent: message.intent, region: message.region, message };
+      decisionMeta = {
+        contractId: context.contractId,
+        policyId: subject.policyId,
+        schemaId: subject.schemaId,
+        subjectId: subject.subjectId
+      };
+
       this.rateLimiter.check(subject, context.principal.id);
       this.policy.assertAllowed("publish", subject, evaluationContext);
       this.enforceSubjectPolicy(subject, message);
@@ -172,8 +166,8 @@ export class PigeonBroker {
         span.setAttribute("pigeon.outcome", "duplicate");
         this.observability.recordDecision("publish", "duplicate", {
           "pigeon.subject": subject.name
-      });
-      span.end();
+        });
+        span.end();
         return { status: "duplicate", message: duplicate };
       }
 
@@ -198,64 +192,85 @@ export class PigeonBroker {
         ...decisionMeta
       });
 
-      // Deliver a queued reply back to a waiting requester, if any (FND-09).
       this.routeReply(subject, committed);
+
       span.setAttribute("pigeon.outcome", "accepted");
       this.observability.recordDecision("publish", "accepted", {
-      "pigeon.subject": subject.name
-    });
+        "pigeon.subject": subject.name
+      });
       span.end();
 
       return { status: "accepted", message: committed };
     } catch (error) {
       span.setAttribute("pigeon.outcome", "denied");
       this.observability.recordDecision("publish", "denied", {
-      "pigeon.subject": subject?.name
-    });
+        "pigeon.subject": subject?.name ?? input?.subject ?? "unknown"
+      });
       span.recordException(error);
       span.end();
 
-      this.handlePublishFailure(subject, message, context, error, decisionMeta);
+      if (subject) {
+        this.handlePublishFailure(subject, message, context, error, decisionMeta);
+      }
       throw error;
     }
   }
 
   receive(subjectName, context, { max = 1 } = {}) {
-    const subject = this.getSubject(subjectName);
-    this.contracts.validate(context.contractId, context.principal.id, subject.name, "receive");
-    this.policy.assertAllowed("receive", subject, { ...context, region: context.region ?? subject.regionPolicy?.home });
+    const span = this.observability.startSpan("pigeon.receive", {
+      "pigeon.operation": "receive",
+      "pigeon.subject": subjectName
+    });
 
-    const cursorKey = `${subjectName}:${context.principal.id}`;
-    const start = this.store.getCursor(cursorKey);
-    const available = this.store.listMessages(subjectName)
-      .slice(start)
-      .filter((message) => !isRedeliveryBlocked(subject, message))
-      .slice(0, max);
+    try {
+      const subject = this.getSubject(subjectName);
+      this.contracts.validate(context.contractId, context.principal.id, subject.name, "receive");
+      this.policy.assertAllowed("receive", subject, { ...context, region: context.region ?? subject.regionPolicy?.home });
 
-    for (const message of available) {
-      message.deliveries.push({
-        principal: context.principal.id,
-        time: new Date().toISOString(),
-        attempt: message.deliveries.length + 1
+      const cursorKey = `${subjectName}:${context.principal.id}`;
+      const start = this.store.getCursor(cursorKey);
+      const available = this.store.listMessages(subjectName)
+        .slice(start)
+        .filter((message) => !isRedeliveryBlocked(subject, message))
+        .slice(0, max);
+
+      for (const message of available) {
+        message.deliveries.push({
+          principal: context.principal.id,
+          time: new Date().toISOString(),
+          attempt: message.deliveries.length + 1
+        });
+        this.audit.write("delivery.dispatched", {
+          subject: subjectName,
+          messageId: message.id,
+          principal: context.principal.id,
+          contractId: context.contractId
+        });
+      }
+
+      if (available.length > 0) {
+        const lastSequence = available[available.length - 1].sequence;
+        const log = this.store.listMessages(subjectName);
+        const newCursor = log.findIndex((message) => message.sequence === lastSequence) + 1;
+        this.store.setCursor(cursorKey, Math.max(start, newCursor));
+      }
+
+      span.setAttribute("pigeon.outcome", "accepted");
+      this.observability.recordDecision("receive", "accepted", {
+        "pigeon.subject": subjectName
       });
-      this.audit.write("delivery.dispatched", {
-        subject: subjectName,
-        messageId: message.id,
-        principal: context.principal.id,
-        contractId: context.contractId
+      span.end();
+
+      return available;
+    } catch (error) {
+      span.setAttribute("pigeon.outcome", "denied");
+      this.observability.recordDecision("receive", "denied", {
+        "pigeon.subject": subjectName
       });
+      span.recordException(error);
+      span.end();
+      throw error;
     }
-
-    // Advance the cursor past the highest dispatched message so at-least-once
-    // delivery does not silently skip work-queue entries that were held back.
-    if (available.length > 0) {
-      const lastSequence = available[available.length - 1].sequence;
-      const log = this.store.listMessages(subjectName);
-      const newCursor = log.findIndex((message) => message.sequence === lastSequence) + 1;
-      this.store.setCursor(cursorKey, Math.max(start, newCursor));
-    }
-
-    return available;
   }
 
   request(subjectName, data, context, options = {}) {
@@ -274,41 +289,62 @@ export class PigeonBroker {
   }
 
   replay(subjectName, context, { reason, fromSequence = 1, toSequence = Infinity } = {}) {
-    const subject = this.getSubject(subjectName);
+    const span = this.observability.startSpan("pigeon.replay", {
+      "pigeon.operation": "replay",
+      "pigeon.subject": subjectName
+    });
 
-    if (!subject.replay?.allowed) {
-      this.audit.write("replay.denied", {
+    try {
+      const subject = this.getSubject(subjectName);
+
+      if (!subject.replay?.allowed) {
+        this.audit.write("replay.denied", {
+          subject: subjectName,
+          principal: context.principal.id,
+          reason: reason ?? null,
+          contractId: context.contractId,
+          policyId: subject.policyId,
+          decision: "deny"
+        });
+        throw new PigeonError("REPLAY_DENIED", `Replay is disabled for ${subjectName}.`);
+      }
+
+      this.contracts.validate(context.contractId, context.principal.id, subject.name, "replay");
+      this.policy.assertAllowed("replay", subject, {
+        ...context,
+        reason,
+        region: context.region ?? subject.regionPolicy?.home
+      });
+
+      const messages = this.store.listMessages(subjectName)
+        .filter((message) => message.sequence >= fromSequence && message.sequence <= toSequence);
+
+      this.audit.write("replay.executed", {
         subject: subjectName,
         principal: context.principal.id,
-        reason: reason ?? null,
+        reason,
+        count: messages.length,
         contractId: context.contractId,
         policyId: subject.policyId,
-        decision: "deny"
+        decision: "allow"
       });
-      throw new PigeonError("REPLAY_DENIED", `Replay is disabled for ${subjectName}.`);
+
+      span.setAttribute("pigeon.outcome", "accepted");
+      this.observability.recordDecision("replay", "accepted", {
+        "pigeon.subject": subjectName
+      });
+      span.end();
+
+      return messages;
+    } catch (error) {
+      span.setAttribute("pigeon.outcome", "denied");
+      this.observability.recordDecision("replay", "denied", {
+        "pigeon.subject": subjectName
+      });
+      span.recordException(error);
+      span.end();
+      throw error;
     }
-
-    this.contracts.validate(context.contractId, context.principal.id, subject.name, "replay");
-    this.policy.assertAllowed("replay", subject, {
-      ...context,
-      reason,
-      region: context.region ?? subject.regionPolicy?.home
-    });
-
-    const messages = this.store.listMessages(subjectName)
-      .filter((message) => message.sequence >= fromSequence && message.sequence <= toSequence);
-
-    this.audit.write("replay.executed", {
-      subject: subjectName,
-      principal: context.principal.id,
-      reason,
-      count: messages.length,
-      contractId: context.contractId,
-      policyId: subject.policyId,
-      decision: "allow"
-    });
-
-    return messages;
   }
 
   ack(subjectName, messageId, context) {
@@ -327,8 +363,6 @@ export class PigeonBroker {
     return message;
   }
 
-  // Collect a reply routed for a correlationId (FND-09). Returns the reply message
-  // or null if none has arrived yet.
   takeReply(correlationId) {
     return this.store.takeReply(correlationId);
   }
@@ -341,8 +375,6 @@ export class PigeonBroker {
     return this.store.listQuarantine();
   }
 
-  // Replay a quarantined message back onto its subject, under a fresh contract held
-  // by an authorized principal (FND-11). The original evidence is left in place.
   releaseQuarantine(quarantineId, context) {
     const record = this.store.findQuarantine(quarantineId);
     if (!record) {
@@ -410,11 +442,6 @@ export class PigeonBroker {
       }
     }
 
-    // subject.data.tokenization = "required" is an enforced guarantee, not just
-    // documentation: a field named here must not carry a raw, un-tokenized card
-    // number. (subject.data.encryption is deliberately NOT enforced here - transport
-    // and at-rest encryption are properties of the deployment, not of a message's
-    // JSON content, and this layer cannot verify them.)
     for (const path of subject.data?.tokenizedFields ?? []) {
       const value = getPath(message.data, path);
       if (typeof value === "string" && looksLikeRawCardNumber(value)) {
@@ -437,8 +464,6 @@ export class PigeonBroker {
     }
   }
 
-  // If this message is a reply carrying a correlationId, hand it to any receiver
-  // waiting on that correlation (FND-09, real request/reply).
   routeReply(subject, message) {
     if (message.correlationId) {
       this.store.resolveReply(message.correlationId, message);
@@ -460,11 +485,9 @@ export class PigeonBroker {
     const shouldQuarantine =
       subject.quarantine?.onSchemaViolation && code === "SCHEMA_INVALID" ||
       subject.quarantine?.onPolicyViolation &&
-        ["SENSITIVE_FIELD_DENIED", "CLASSIFICATION_DENIED", "REGION_DENIED", "INTENT_DENIED", "RAW_PAN_DETECTED"].includes(code);
+      ["SENSITIVE_FIELD_DENIED", "CLASSIFICATION_DENIED", "REGION_DENIED", "INTENT_DENIED", "RAW_PAN_DETECTED"].includes(code);
 
     if (shouldQuarantine && message) {
-      // The record is kept as evidence, but it must not become a durable plaintext
-      // copy of the sensitive value that got the message denied in the first place.
       const redactedPaths = [...(subject.data?.forbiddenFields ?? []), ...(subject.data?.tokenizedFields ?? [])];
       const stored = this.store.addQuarantine({
         subject: subject.name,
@@ -506,7 +529,6 @@ function validateEnvelope(input) {
   }
 }
 
-// A work-queue message that has already been acked should not be redelivered.
 function isRedeliveryBlocked(subject, message) {
   if (subject.mode !== "workQueue") {
     return false;
@@ -566,10 +588,6 @@ function getPath(value, path) {
   return current;
 }
 
-// True if `value` is a digit string of card-number length that passes the Luhn
-// checksum - i.e. it looks like a raw PAN rather than an opaque token. Tokens
-// issued by a real tokenization provider do not pass Luhn, so this only flags
-// the case tokenization is meant to prevent: a raw card number sent as-is.
 function looksLikeRawCardNumber(value) {
   const digits = value.replace(/[ -]/g, "");
   if (!/^\d{13,19}$/.test(digits)) {
@@ -589,9 +607,6 @@ function looksLikeRawCardNumber(value) {
   return sum % 10 === 0;
 }
 
-// Deep-clones `message` and replaces the value at each dot-path in `paths` with a
-// redaction marker, so quarantine evidence never becomes a durable plaintext copy
-// of the sensitive value that caused the denial.
 function redactMessage(message, paths) {
   if (paths.length === 0) {
     return message;
