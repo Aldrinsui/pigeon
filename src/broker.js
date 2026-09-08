@@ -124,6 +124,7 @@ export class PigeonBroker {
   }
 
   publish(input, context) {
+    requireAuthenticatedContext(context);
     validateEnvelope(input);
     const subject = this.getSubject(input.subject);
     const { subject: contractSubject } = this.contracts.validate(
@@ -196,6 +197,7 @@ export class PigeonBroker {
   }
 
   receive(subjectName, context, { max = 1 } = {}) {
+    requireAuthenticatedContext(context);
     const subject = this.getSubject(subjectName);
     this.contracts.validate(context.contractId, context.principal.id, subject.name, "receive");
     this.policy.assertAllowed("receive", subject, { ...context, region: context.region ?? subject.regionPolicy?.home });
@@ -249,6 +251,7 @@ export class PigeonBroker {
   }
 
   replay(subjectName, context, { reason, fromSequence = 1, toSequence = Infinity } = {}) {
+    requireAuthenticatedContext(context);
     const subject = this.getSubject(subjectName);
 
     if (!subject.replay?.allowed) {
@@ -287,6 +290,7 @@ export class PigeonBroker {
   }
 
   ack(subjectName, messageId, context) {
+    requireAuthenticatedContext(context);
     const subject = this.getSubject(subjectName);
     this.contracts.validate(context.contractId, context.principal.id, subject.name, "ack");
     this.policy.assertAllowed("ack", subject, { ...context, region: context.region ?? subject.regionPolicy?.home });
@@ -459,6 +463,12 @@ export class PigeonBroker {
         ...decisionMeta
       });
     }
+  }
+}
+
+function requireAuthenticatedContext(context) {
+  if (!context?.principal?.id) {
+    throw new PigeonError("UNAUTHENTICATED", "Requires an authenticated principal.");
   }
 }
 

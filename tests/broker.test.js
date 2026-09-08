@@ -95,6 +95,19 @@ test("denies a publish with no contract", () => {
   );
 });
 
+test("publish/receive/replay/ack fail closed with a clean error when context is missing, not a raw TypeError", () => {
+  const { broker } = checkoutSession();
+  const isUnauthenticated = (error) => error instanceof PigeonError && error.code === "UNAUTHENTICATED";
+
+  assert.throws(
+    () => broker.publish({ subject: "payments.authorize", type: "t", source: "x", intent: "authorize_payment", data: payment() }),
+    isUnauthenticated
+  );
+  assert.throws(() => broker.receive("payments.authorize"), isUnauthenticated);
+  assert.throws(() => broker.replay("payments.authorize"), isUnauthenticated);
+  assert.throws(() => broker.ack("payments.authorize", "msg_1"), isUnauthenticated);
+});
+
 test("blocks producer spoofing: a principal cannot use another's contract", () => {
   const broker = createDemoBroker(PigeonBroker);
   const checkoutContract = broker.negotiate(checkout, { subjects: ["payments.authorize"] });
